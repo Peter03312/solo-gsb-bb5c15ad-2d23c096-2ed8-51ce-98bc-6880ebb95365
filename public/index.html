@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>离心转子配平</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>离心转子配平</h1>
+    <div id="hashline" class="hashline"></div>
+  </header>
+
+  <div id="alert" class="alert hidden"></div>
+
+  <main>
+    <section class="card" id="sec-config">
+      <h2>1. 转子配置</h2>
+      <div class="form-row">
+        <label>孔位数（偶数，4–12）
+          <select id="holes"></select>
+        </label>
+        <label>允许对径差（g）
+          <input id="tolerance" type="number" step="0.0001" min="0" />
+        </label>
+      </div>
+      <div>
+        <h3>各孔最大质量（g）</h3>
+        <div id="holemax" class="holemax-grid"></div>
+      </div>
+      <div class="actions">
+        <button id="save-config" class="primary">保存转子配置</button>
+      </div>
+    </section>
+
+    <section class="card" id="sec-tubes">
+      <h2>2. 离心管（本次全部装入）</h2>
+      <div class="table-wrap">
+        <table id="tubes-table">
+          <thead>
+            <tr><th>编号</th><th>称重质量 (g)</th><th>可用孔位</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="actions">
+        <button id="add-tube">＋ 添加离心管</button>
+        <button id="save-tubes" class="primary">保存离心管并配平</button>
+      </div>
+    </section>
+
+    <section class="card" id="sec-weights">
+      <h2>3. 可选配重块</h2>
+      <div class="table-wrap">
+        <table id="weights-table">
+          <thead>
+            <tr><th>质量 (g)</th><th>数量</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="actions">
+        <button id="add-weight">＋ 添加配重规格</button>
+        <button id="save-weights" class="primary">保存配重块并配平</button>
+      </div>
+    </section>
+
+    <section class="card" id="sec-draft">
+      <h2>4. 可行装载图（草稿）</h2>
+      <div id="draft-stale" class="banner warn hidden">
+        称重质量或配重数量已变化，此草稿基于旧数据，须点击「按当前数据重算」。
+      </div>
+      <div id="draft-none" class="muted">尚无草稿，保存数据后会自动计算，或点击下方按钮手动重算。</div>
+      <div id="draft-body" class="hidden"></div>
+      <div class="actions">
+        <button id="recompute">按当前数据重算</button>
+        <button id="publish" class="primary" disabled>发布并冻结此装载图</button>
+      </div>
+    </section>
+
+    <section class="card" id="sec-pubs">
+      <h2>5. 已发布装载图</h2>
+      <div id="pub-list"></div>
+    </section>
+
+    <section class="card" id="sec-verify">
+      <h2>6. 现场装载核验</h2>
+      <div class="muted" style="margin-bottom:10px">
+        选择上方「✓ 可用于当前装载」的发布记录，按孔位录入实际物件编号与实测质量（有限正数）；
+        空孔保持为空、质量 0。可随时暂存并恢复；同一发布记录只保留一份未完成核验。
+      </div>
+      <div id="verify-list"></div>
+    </section>
+  </main>
+
+  <dialog id="pub-dialog">
+    <div class="dialog-head">
+      <h3 id="pub-title"></h3>
+      <button id="pub-close" class="icon-btn">✕</button>
+    </div>
+    <div id="pub-detail"></div>
+  </dialog>
+
+  <dialog id="ver-dialog">
+    <div class="dialog-head">
+      <h3 id="ver-title"></h3>
+      <button id="ver-close" class="icon-btn">✕</button>
+    </div>
+    <div id="ver-detail"></div>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
