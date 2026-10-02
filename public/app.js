@@ -10,6 +10,7 @@ for (let n = 4; n <= 12; n += 2) {
 }
 
 let state = null; // GET /api/state 的完整响应
+let occupancy = null; // GET /api/reservations/occupancy 的完整响应（预约日程）
 // 编辑区本地缓冲
 let editorN = null;
 let tubeRows = []; // {id, mass, holes:Set}
@@ -48,6 +49,11 @@ const fmt = (x) => (typeof x === 'number' ? String(Math.round(x * 1e6) / 1e6) : 
 
 async function refresh(flash) {
   state = await api('GET', '/api/state');
+  try {
+    occupancy = await api('GET', '/api/reservations/occupancy');
+  } catch (_) {
+    occupancy = null; // 占用日程获取失败不阻塞主界面
+  }
   renderAll();
   if (flash) showAlert(flash, 'ok');
   else clearAlert();
@@ -81,6 +87,7 @@ function renderAll() {
   renderDraft();
   renderPublications();
   renderVerifications();
+  renderReservations();
 }
 
 function renderHoleMax(d) {
@@ -704,6 +711,162 @@ $('#ver-close').addEventListener('click', () => {
   verRows = [];
   refresh().catch(() => {});
 });
+
+// ---------- 配重块预约（时段复用） ----------
+
+const fmtUtc = (iso) => (iso ? iso.slice(0, 16).replace('T', ' ') : '');
+
+function renderReservations() {
+  // 可选发布图下拉（仅「✓ 可用于当前装载」的可行记录），尽量保留当前选择
+  const sel = $('#res-pub');
+  const prev = sel.value;
+  const usable = (state.publications || []).filter((p) => p.feasible && p.usable);
+  sel.innerHTML = usable.length
+    ? usable
+        .map(
+          (p) =>
+            `<option value="${p.id}">#${p.id} · ${p.createdAt} · 配重 ${p.weightCount} 枚</option>`,
+        )
+        .join('')
+    : '<option value="">（暂无可用发布图）</option>';
+  if (usable.some((p) => String(p.id) === prev)) sel.value = prev;
+  $('#res-create').disabled = usable.length === 0;
+
+  renderOccupancy();
+  renderReservationList();
+}
+
+function renderOccupancy() {
+  const box = $('#res-occupancy');
+  if (!occupancy || !occupancy.specs || occupancy.specs.length === 0) {
+    box.innerHTML = '<div class="muted">暂无配重规格。</div>';
+    return;
+  }
+  const rows = occupancy.specs
+    .map((s) => {
+      const segs = s.segments.length
+        ? s.segments
+            .map((g) => `${fmtUtc(g.start)} – ${fmtUtc(g.end)}：占用 ${g.occupied} 枚`)
+            .join('<br>')
+        : '<span class="muted">（窗口内无占用）</span>';
+      return `<tr${s.exceeded ? ' class="row-bad"' : ''}>
+        <td>${fmt(s.mass)} g</td>
+        <td>${s.quantity}</td>
+        <td>${s.peak}</td>
+        <td class="${s.exceeded ? 'tag-bad' : 'tag-ok'}">${
+          s.exceeded ? '✗ 不足（峰值超当前可选）' : '✓ 充足'
+        }</td>
+        <td>${segs}</td>
+      </tr>`;
+    })
+    .join('');
+  box.innerHTML = `
+    <div class="muted" style="margin-bottom:6px">
+      日程窗口 ${fmtUtc(occupancy.from)} – ${fmtUtc(occupancy.to)}（UTC，左闭右开）
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>规格</th><th>当前可选</th><th>峰值占用</th><th>判定</th><th>占用时段</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
+}
+
+function renderReservationList() {
+  const box = $('#res-list');
+  const list = state.reservations || [];
+  if (list.length === 0) {
+    box.innerHTML = '<div class="muted">暂无预约。</div>';
+    return;
+  }
+  const now = new Date().toISOString();
+  box.innerHTML = list
+    .map((r) => {
+      const usage = r.usage.length
+        ? r.usage.map((u) => `${fmt(u.mass)}g×${u.count}`).join('、')
+        : '（不使用配重块）';
+      let badge;
+      let canCancel = false;
+      if (r.status === 'cancelled') {
+        badge = '<span class="badge bad">✗ 已取消（历史保留，不再占用）</span>';
+      } else if (now < r.start) {
+        badge = '<span class="badge ok">✓ 已预约（未开始）</span>';
+        canCancel = true;
+      } else if (now < r.end) {
+        badge = '<span class="badge stale">⏳ 进行中</span>';
+      } else {
+        badge = '<span class="badge stale">· 已结束</span>';
+      }
+      return `<div class="pub-row">
+        <div>
+          <b>${escapeHtml(r.batchNo)}</b>
+          <span class="muted">#${r.id} · 发布图 #${r.publicationId}${
+            r.publicationUsable ? '' : '（已失效）'
+          } · ${fmtUtc(r.start)} – ${fmtUtc(r.end)} UTC · ${usage}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px">
+          ${canCancel ? `<button data-res-cancel="${r.id}" class="danger">取消预约</button>` : ''}
+          ${badge}
+        </div>
+      </div>`;
+    })
+    .join('');
+  box.querySelectorAll('[data-res-cancel]').forEach((b) =>
+    b.addEventListener('click', () => cancelReservationById(Number(b.dataset.resCancel))),
+  );
+}
+
+async function cancelReservationById(id) {
+  try {
+    await api('POST', `/api/reservations/${id}/cancel`);
+    await refresh('预约已取消：历史保留，占用已释放。');
+  } catch (e) {
+    showAlert(e.message, 'err');
+  }
+}
+
+$('#res-create').addEventListener('click', async () => {
+  const batchNo = $('#res-batch').value.trim();
+  const publicationId = Number($('#res-pub').value);
+  const s = $('#res-start').value; // datetime-local 按 UTC 解释
+  const e = $('#res-end').value;
+  $('#res-conflict').innerHTML = '';
+  try {
+    const r = await api('POST', '/api/reservations', {
+      batchNo,
+      publicationId,
+      start: s ? `${s}Z` : '',
+      end: e ? `${e}Z` : '',
+    });
+    await refresh(
+      r.status === 'cancelled'
+        ? `批次号「${batchNo}」对应已取消的历史预约 #${r.id}，未重新占用。`
+        : `预约 #${r.id} 已登记：批次号「${batchNo}」（重复提交同内容将返回同一记录）。`,
+    );
+  } catch (err) {
+    if (err.data && err.data.detail && err.data.detail.conflicts) {
+      renderResConflict(err.data.detail.conflicts);
+    }
+    showAlert(err.message, 'err');
+  }
+});
+
+// 容量不足：列出冲突规格与时段（服务端 detail.conflicts）
+function renderResConflict(conflicts) {
+  $('#res-conflict').innerHTML = `<div class="banner bad" style="margin-top:12px">
+    <b>配重块不足，本次未产生任何占用：</b>
+    <ul>${conflicts
+      .map(
+        (c) => `<li>质量 ${fmt(c.mass)} g：本次需 ${c.needed} 枚、当前可选 ${c.available} 枚；冲突时段：
+          <ul>${c.slots
+            .map(
+              (s) =>
+                `<li>${fmtUtc(s.start)} – ${fmtUtc(s.end)} UTC：已占用 ${s.occupied} 枚（叠加后 ${s.required} 枚）</li>`,
+            )
+            .join('')}</ul>
+        </li>`,
+      )
+      .join('')}</ul>
+  </div>`;
+}
 
 // ---------- 启动 ----------
 

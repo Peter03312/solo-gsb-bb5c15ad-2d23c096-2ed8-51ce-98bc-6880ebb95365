@@ -67,6 +67,22 @@ CREATE TABLE IF NOT EXISTS publications (
 -- 现场装载核验：一条发布记录至多一份（草稿或完成），UNIQUE 约束兜底。
 -- version 为乐观锁：每次暂存自增，更新须携带旧版本以防覆盖他人修改。
 -- 完成后 completed_at 置位、result_json 冻结，之后草稿与完成结果均不可改写。
+-- 配重块预约：批次号为幂等键（UNIQUE 兜底）；时段为 UTC ISO 字符串，左闭右开。
+-- usage_json 冻结「按发布图统计的各质量规格占用」，创建后不再改写；
+-- 取消仅置 status/cancelled_at，历史保留且不再计入占用。
+CREATE TABLE IF NOT EXISTS reservations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_no TEXT NOT NULL UNIQUE,
+  publication_id INTEGER NOT NULL,
+  start_utc TEXT NOT NULL,
+  end_utc TEXT NOT NULL,
+  usage_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'cancelled')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  cancelled_at TEXT,
+  FOREIGN KEY (publication_id) REFERENCES publications(id)
+);
+
 CREATE TABLE IF NOT EXISTS verifications (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   publication_id INTEGER NOT NULL UNIQUE,
@@ -207,6 +223,61 @@ export function insertPublication(
       JSON.stringify(reasons ?? []),
     );
   return info.lastInsertRowid;
+}
+
+// ---------- 配重块预约（由 server 在单事务内调用） ----------
+
+export function insertReservation(db, { batchNo, publicationId, start, end, usage }) {
+  const info = db
+    .prepare(
+      `INSERT INTO reservations (batch_no, publication_id, start_utc, end_utc, usage_json)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(batchNo, publicationId, start, end, JSON.stringify(usage));
+  return info.lastInsertRowid;
+}
+
+export function getReservationRow(db, id) {
+  return db.prepare('SELECT * FROM reservations WHERE id = ?').get(id);
+}
+
+// 连发布表取冻结依据（用于「依据图当前是否仍可用」的展示标记）
+export function getReservationRowJoined(db, id) {
+  return db
+    .prepare(
+      `SELECT r.*, p.basis_hash AS pub_basis_hash, p.feasible AS pub_feasible
+         FROM reservations r
+         JOIN publications p ON p.id = r.publication_id
+        WHERE r.id = ?`,
+    )
+    .get(id);
+}
+
+export function getReservationByBatch(db, batchNo) {
+  return db.prepare('SELECT * FROM reservations WHERE batch_no = ?').get(batchNo);
+}
+
+export function listReservationRows(db) {
+  return db
+    .prepare(
+      `SELECT r.*, p.basis_hash AS pub_basis_hash, p.feasible AS pub_feasible
+         FROM reservations r
+         JOIN publications p ON p.id = r.publication_id
+        ORDER BY r.start_utc, r.id`,
+    )
+    .all();
+}
+
+// 取消：仅未开始（由 server 判定）且仍 active 的预约；返回 null 表示未命中。
+export function cancelReservation(db, id, cancelledAt) {
+  const info = db
+    .prepare(
+      `UPDATE reservations
+          SET status = 'cancelled', cancelled_at = ?
+        WHERE id = ? AND status = 'active'`,
+    )
+    .run(cancelledAt, id);
+  return info.changes === 1 ? getReservationRow(db, id) : null;
 }
 
 // ---------- 现场核验 ----------
