@@ -20,9 +20,23 @@ import {
   updateVerificationEntries,
   completeVerification,
   listVerificationRows,
+  listReservationRows,
+  getReservationRow,
+  getReservationRowByBatch,
+  listOverlappingActiveReservations,
+  listActiveReservations,
+  insertReservation,
+  cancelReservation,
 } from './db.js';
 import { solve, verify, computeHash } from './solver.js';
 import { normalizeEntries, measureProgress, verifyMeasurements } from './verify.js';
+import {
+  parseUtcMs,
+  toIso,
+  planUsage,
+  checkCapacity,
+  buildSchedule,
+} from './reserve.js';
 import {
   ValidationError,
   ConflictError,
@@ -60,6 +74,9 @@ export function createApp(db) {
       draft,
       publications,
       verifications: serializeVerifications(db, hash),
+      reservations: listReservationRows(db).map((r) =>
+        reservationView(r, hash, Date.now()),
+      ),
     });
   });
 
@@ -207,6 +224,247 @@ export function createApp(db) {
     if (!pub) return res.status(404).json({ error: '发布记录不存在' });
     const hash = currentHash(db);
     res.json({ ...pub, usable: pub.feasible && pub.basisHash === hash });
+  });
+
+  // ---------- 配重块时段预约 ----------
+  //
+  // 时段按左闭右开 [start, end) 计算；占用量按冻结装载图统计（各质量规格）。
+  // 创建在单个事务内原子完成：重读冻结图、当前可选数量与重叠的生效中预约，
+  // 任一时刻同规格预约总量不得超过当前录入数量；不足时返回冲突规格与时段，
+  // 不产生任何部分占用。批次号为幂等键：同号同内容返回原记录（含已取消记录，
+  // 不重新占用），同号不同内容拒绝。仅未开始的预约可取消，取消后历史保留。
+
+  // 列表/详情视图：状态、阶段（相对当前时刻）、依据图当前可用性
+  function reservationView(row, hash, nowMs) {
+    const startMs = Date.parse(row.start_utc);
+    const endMs = Date.parse(row.end_utc);
+    const phase =
+      row.status === 'cancelled'
+        ? 'cancelled'
+        : nowMs < startMs
+          ? 'notStarted'
+          : nowMs < endMs
+            ? 'ongoing'
+            : 'ended';
+    return {
+      id: row.id,
+      batchNo: row.batch_no,
+      publicationId: row.publication_id,
+      startUtc: row.start_utc,
+      endUtc: row.end_utc,
+      usage: JSON.parse(row.usage_json),
+      status: row.status,
+      phase,
+      cancellable: row.status === 'active' && nowMs < startMs,
+      createdAt: row.created_at,
+      cancelledAt: row.cancelled_at,
+      publicationUsable:
+        hash !== null &&
+        !!row.pub_basis_hash &&
+        row.pub_basis_hash === hash &&
+        !!row.pub_feasible,
+    };
+  }
+
+  app.post('/api/reservations', (req, res, next) => {
+    try {
+      const body = req.body || {};
+      const errors = [];
+      const batchNo = typeof body.batchNo === 'string' ? body.batchNo.trim() : '';
+      if (!batchNo) errors.push('批次号不能为空');
+      else if (batchNo.length > 100) errors.push('批次号过长（最多 100 字符）');
+      const publicationId = Number(body.publicationId);
+      if (!Number.isInteger(publicationId) || publicationId <= 0) {
+        errors.push('publicationId 必须是发布记录编号（正整数）');
+      }
+      const startMs = parseUtcMs(body.startUtc);
+      const endMs = parseUtcMs(body.endUtc);
+      if (startMs === null) errors.push('开始时间不是合法的 UTC 时间（ISO 8601）');
+      if (endMs === null) errors.push('结束时间不是合法的 UTC 时间（ISO 8601）');
+      if (startMs !== null && endMs !== null && !(startMs < endMs)) {
+        errors.push('开始时间必须早于结束时间（时段按左闭右开 [start, end) 计算）');
+      }
+      if (errors.length) throw new ValidationError(errors);
+
+      const startUtc = toIso(startMs);
+      const endUtc = toIso(endMs);
+
+      let status = 201;
+      let view;
+      const tx = db.transaction(() => {
+        // 幂等：同批次号重复提交——内容一致返回原记录（含已取消记录，不重新占用），
+        // 内容不同拒绝。
+        const existing = getReservationRowByBatch(db, batchNo);
+        if (existing) {
+          const same =
+            existing.publication_id === publicationId &&
+            existing.start_utc === startUtc &&
+            existing.end_utc === endUtc;
+          if (!same) {
+            throw new ConflictError(
+              [`批次号「${batchNo}」已被使用且预约内容不同，拒绝重复提交`],
+              { existingId: existing.id },
+            );
+          }
+          view = reservationView(existing, currentHash(db), Date.now());
+          status = 200;
+          return;
+        }
+
+        // 原子重读：冻结图、当前数量、重叠预约
+        const pub = getPublication(db, publicationId);
+        if (!pub) {
+          throw new ValidationError([`发布记录 #${publicationId} 不存在（未知装载图）`]);
+        }
+        if (!pub.feasible) {
+          throw new ValidationError([
+            `发布记录 #${publicationId} 不含可行装载图，不能用于预约`,
+          ]);
+        }
+        const hash = currentHash(db);
+        if (hash === null || pub.basisHash !== hash) {
+          throw new ValidationError([
+            `发布记录 #${publicationId} 当前不可用于装载（录入数据已变化），请选择仍可用的发布记录`,
+          ]);
+        }
+        const data = loadData(db);
+        const capacityOf = (mass) => {
+          const w = data.weights.find((x) => x.mass === mass);
+          return w ? w.quantity : 0;
+        };
+        const usage = planUsage(pub);
+        const overlapping = listOverlappingActiveReservations(db, startUtc, endUtc).map(
+          (r) => ({
+            startMs: Date.parse(r.start_utc),
+            endMs: Date.parse(r.end_utc),
+            usage: JSON.parse(r.usage_json),
+          }),
+        );
+        const check = checkCapacity({ usage, capacityOf, overlapping, startMs, endMs });
+        if (!check.ok) {
+          const errs = ['当前可选数量不足，预约未产生任何占用：'];
+          for (const c of check.conflicts) {
+            for (const w of c.windows) {
+              errs.push(
+                `规格 ${c.mass} g：${w.start} 至 ${w.end} 已占用 ${w.used} 枚，` +
+                  `本次需 ${c.required} 枚，超出当前可选数量 ${c.capacity} 枚`,
+              );
+            }
+          }
+          throw new ConflictError(errs, { detail: { conflicts: check.conflicts } });
+        }
+        const row = insertReservation(db, {
+          batchNo,
+          publicationId,
+          startUtc,
+          endUtc,
+          usage,
+        });
+        view = reservationView(row, hash, Date.now());
+      });
+      tx();
+      res.status(status).json(view);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  app.get('/api/reservations', (req, res) => {
+    const hash = currentHash(db);
+    const nowMs = Date.now();
+    res.json(listReservationRows(db).map((r) => reservationView(r, hash, nowMs)));
+  });
+
+  app.get('/api/reservations/:id', (req, res, next) => {
+    const row = getReservationRow(db, Number(req.params.id));
+    if (!row) return res.status(404).json({ error: '预约记录不存在' });
+    res.json(reservationView(row, currentHash(db), Date.now()));
+  });
+
+  // 取消：仅未开始的预约可取消；已取消的预约幂等返回原记录（历史保留）
+  app.post('/api/reservations/:id/cancel', (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const existed = getReservationRow(db, id);
+      if (!existed) return res.status(404).json({ error: '预约记录不存在' });
+      let view;
+      const tx = db.transaction(() => {
+        const row = getReservationRow(db, id);
+        if (row.status === 'cancelled') {
+          view = reservationView(row, currentHash(db), Date.now());
+          return;
+        }
+        const nowMs = Date.now();
+        if (nowMs >= Date.parse(row.start_utc)) {
+          throw new ConflictError([
+            `预约 #${id} 已开始（${row.start_utc}），仅未开始的预约可取消`,
+          ]);
+        }
+        const updated = cancelReservation(db, id, toIso(nowMs));
+        if (!updated) throw new ConflictError([`预约 #${id} 状态已变化，请刷新后重试`]);
+        view = reservationView(updated, currentHash(db), nowMs);
+      });
+      tx();
+      res.json(view);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // 预约日程：各质量规格在 [from, to) 内的分段占用与「不足」区段
+  // （占用超过当前录入数量即标记不足；既有预约不因数量减少/图失效被改写）
+  app.get('/api/schedule', (req, res, next) => {
+    try {
+      const active = listActiveReservations(db).map((r) => ({
+        startMs: Date.parse(r.start_utc),
+        endMs: Date.parse(r.end_utc),
+        usage: JSON.parse(r.usage_json),
+      }));
+      const fromMs = parseUtcMs(req.query.from);
+      const toMs = parseUtcMs(req.query.to);
+      if (req.query.from !== undefined && fromMs === null) {
+        throw new ValidationError(['from 不是合法的 UTC 时间（ISO 8601）']);
+      }
+      if (req.query.to !== undefined && toMs === null) {
+        throw new ValidationError(['to 不是合法的 UTC 时间（ISO 8601）']);
+      }
+      const from =
+        fromMs !== null
+          ? fromMs
+          : active.length
+            ? Math.min(...active.map((r) => r.startMs))
+            : Date.now();
+      const to =
+        toMs !== null
+          ? toMs
+          : active.length
+            ? Math.max(...active.map((r) => r.endMs))
+            : from;
+      if (!(from < to)) {
+        if (from === to && active.length === 0) {
+          return res.json({ from: toIso(from), to: toIso(to), specs: [] });
+        }
+        throw new ValidationError(['from 必须早于 to（时段按左闭右开 [from, to) 计算）']);
+      }
+      const data = loadData(db);
+      const capacityOf = (mass) => {
+        const w = data && data.weights.find((x) => x.mass === mass);
+        return w ? w.quantity : 0;
+      };
+      const massSet = new Set();
+      if (data) for (const w of data.weights) massSet.add(w.mass);
+      for (const r of active) for (const u of r.usage) massSet.add(u.mass);
+      const specs = buildSchedule({
+        reservations: active,
+        masses: [...massSet].sort((a, b) => a - b),
+        capacityOf,
+        fromMs: from,
+        toMs: to,
+      });
+      res.json({ from: toIso(from), to: toIso(to), specs });
+    } catch (e) {
+      next(e);
+    }
   });
 
   // ---------- 现场装载核验 ----------

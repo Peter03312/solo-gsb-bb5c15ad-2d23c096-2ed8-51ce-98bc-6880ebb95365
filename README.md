@@ -17,6 +17,15 @@
 完成时在**单个数据库事务**内重读发布快照与当前数据，逐孔核对物件与承重、逐对核对径差
 以及发布记录的当前可用性，通过后冻结实测值、判定明细与发布编号。
 
+实验室在不同时段复用配重块：操作者凭**批次号 + 当前可用的已发布装载图 + UTC 起止时间**
+预约配重块（起点须早于终点，非法时间或未知图一律拒绝）。时段按**左闭右开** `[start, end)`
+计算，占用量按**冻结图**统计到各质量规格；创建预约在**单个数据库事务**内原子重读冻结图、
+当前可选数量与重叠的生效中预约——任一时刻同规格预约总量不得超过当前录入数量，
+不足时返回**冲突规格与时段**且**不产生任何部分占用**。批次号为幂等键：同号同内容重复提交
+返回原记录，同号不同内容拒绝；**仅未开始的预约可取消**，取消后保留历史且同号重试不重新占用。
+录入数量减少或图失效**不改写既有预约**，后续预约仍按当前数量与图可用性判定，
+预约日程中展示已有占用及不足区段。
+
 ## 约束模型
 
 - 孔位编号 `0 … N-1`，孔位数 N 为 4–12 的偶数；孔 `i` 与孔 `i + N/2` 对径。
@@ -110,6 +119,17 @@ npm test
       任一不通过：弹窗列出原因并在表中高亮对应孔位/孔对，**草稿保留、不生成完成记录**。
    5. 核验通过后**冻结**实测值、逐孔/逐对判定明细与发布编号；重复完成幂等返回同一份结果，
       不再产生第二份；此后再修改录入会被拒绝，已完成核验不被改写。
+7. **配重块时段预约**（第 7 节）：
+   1. 选择「✓ 可用于当前装载」的发布图，填写批次号与 UTC 起止时间（页面输入按 UTC 解释），
+      提交预约。占用量按冻结图统计（如 `50 g × 1`）。
+   2. 时段按左闭右开计算：前一条的终点与后一条的起点相接时互不冲突。
+   3. 数量不足时页面列出冲突规格与时段（既有占用、本次需求、当前可选数量），
+      本次预约不产生任何占用。
+   4. 同批次号同内容重复提交返回原记录（已取消的亦返回原取消记录，不重新占用）；
+      同号不同内容被拒绝。
+   5. 仅未开始的预约可「取消预约」；取消后历史保留、占用释放。
+   6. 「占用日程」按当前录入数量展示各规格的分段占用；数量减少或图失效后，
+      既有预约保持不变，超出当前数量的区段标记为「不足」。
 
 ## REST API 摘要
 
@@ -128,11 +148,17 @@ npm test
 | GET | `/api/verifications/:id` | 核验详情（冻结快照、暂存/冻结录入；完成后附判定明细） |
 | PUT | `/api/verifications/:id` | 暂存孔位录入（整表替换），须携带 `version`；过期返回 409 |
 | POST | `/api/verifications/:id/complete` | 事务内重读快照与当前数据完成判定；不通过 400（原因定位孔位/孔对，草稿保留）；重复完成幂等 200 |
+| POST | `/api/reservations` | 创建配重块时段预约（批次号 + 可用发布图 + UTC 起止，左闭右开）；事务内原子重读图/当前数量/重叠预约；201 新建、200 幂等重放、400 非法输入或图不可用、409 批次冲突或数量不足（附冲突规格与时段） |
+| GET | `/api/reservations` | 预约列表（含状态、阶段、依据图当前可用性、各规格占用） |
+| GET | `/api/reservations/:id` | 单条预约详情 |
+| POST | `/api/reservations/:id/cancel` | 取消预约（仅未开始）；已取消幂等返回原记录；已开始 409 |
+| GET | `/api/schedule?from=&to=` | 预约日程：各质量规格在时段内的分段占用、峰值与「不足」区段（按当前录入数量判定）；from/to 缺省为覆盖全部生效中预约 |
 
-错误统一返回 `400 {"error","errors":[...]}`；状态冲突（草稿已存在、版本过期、核验已冻结等）
-返回 `409` 并附带 `existingId` / `currentVersion` 等字段。核验完成失败时 400 响应的
-`detail.checks` 内带逐孔（`objectMatch`、`withinCapacity`）与逐对（`withinTolerance`）判定，
-可直接用于前端高亮定位。
+错误统一返回 `400 {"error","errors":[...]}`；状态冲突（草稿已存在、版本过期、核验已冻结、
+预约批次号冲突、配重数量不足等）返回 `409` 并附带 `existingId` / `currentVersion` 等字段。
+核验完成失败时 400 响应的 `detail.checks` 内带逐孔（`objectMatch`、`withinCapacity`）与
+逐对（`withinTolerance`）判定，可直接用于前端高亮定位；预约数量不足时 409 响应的
+`detail.conflicts` 内带冲突规格、当前可选数量与超限时段（`windows`），可直接用于日程定位。
 
 ## 现场核验 HTTP API 调用示例
 
@@ -178,16 +204,70 @@ curl -s $BASE/api/verifications
 curl -s $BASE/api/verifications/1
 ```
 
+## 配重块时段预约 HTTP API 调用示例
+
+```bash
+BASE=http://localhost:8080
+
+# 1) 创建预约：批次号 + 当前可用发布图 + UTC 起止（左闭右开 [start, end)）
+#    占用量按冻结图统计；201 新建成功
+curl -s -X POST $BASE/api/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BATCH-001","publicationId":1,
+       "startUtc":"2026-10-03T08:00:00Z","endUtc":"2026-10-03T12:00:00Z"}'
+# -> {"id":1,"batchNo":"BATCH-001","publicationId":1,
+#     "startUtc":"2026-10-03T08:00:00.000Z","endUtc":"2026-10-03T12:00:00.000Z",
+#     "usage":[{"mass":50,"count":1}],"status":"active","phase":"notStarted",
+#     "cancellable":true,"publicationUsable":true,...}
+
+# 2) 幂等：同批次号同内容重复提交 → 200 返回原记录（不产生新占用）；
+#    同批次号不同内容 → 409 {"existingId":1}
+curl -s -X POST $BASE/api/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BATCH-001","publicationId":1,
+       "startUtc":"2026-10-03T08:00:00Z","endUtc":"2026-10-03T12:00:00Z"}'
+
+# 3) 数量不足：409，detail.conflicts 给出冲突规格与时段，不产生任何部分占用
+curl -s -X POST $BASE/api/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BATCH-002","publicationId":1,
+       "startUtc":"2026-10-03T10:00:00Z","endUtc":"2026-10-03T14:00:00Z"}'
+# -> 409 {"errors":["当前可选数量不足，预约未产生任何占用：",
+#                   "规格 50 g：2026-10-03T10:00:00.000Z 至 2026-10-03T12:00:00.000Z
+#                    已占用 1 枚，本次需 1 枚，超出当前可选数量 1 枚"],
+#         "detail":{"conflicts":[{"mass":50,"required":1,"capacity":1,"peak":1,
+#                    "windows":[{"start":"...","end":"...","used":1}]}]}}
+
+# 4) 左闭右开：与既有预约终点相接的起点不冲突 → 201
+curl -s -X POST $BASE/api/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BATCH-002","publicationId":1,
+       "startUtc":"2026-10-03T12:00:00Z","endUtc":"2026-10-03T14:00:00Z"}'
+
+# 5) 取消：仅未开始的预约可取消；已取消重复调用幂等返回原记录；
+#    取消后同批次号同内容重试仍返回该取消记录（不重新占用）
+curl -s -X POST $BASE/api/reservations/2/cancel
+
+# 6) 预约列表 / 单条 / 日程（from/to 可省略，缺省覆盖全部生效中预约）
+curl -s $BASE/api/reservations
+curl -s $BASE/api/reservations/1
+curl -s "$BASE/api/schedule?from=2026-10-03T00:00:00Z&to=2026-10-04T00:00:00Z"
+# -> {"from":"...","to":"...","specs":[{"mass":50,"capacity":1,"peak":1,
+#      "shortage":false,"segments":[{"start":"...","end":"...","used":1,"shortage":false}]}]}
+#    录入数量减少后：既有预约不变，capacity 随之下降，占用超限的区段 shortage=true
+```
+
 ## 目录结构
 
 ```
 src/
-  server.js     Express 服务与路由、原子发布/核验事务
+  server.js     Express 服务与路由、原子发布/核验/预约事务
   db.js         SQLite 连接、建表、数据访问
   solver.js     求解器、独立复核、数据指纹（纯函数，含测试）
   verify.js     现场核验：录入规整、进度、完成判定（纯函数，含测试）
+  reserve.js    时段预约：UTC 时间解析、冻结图占用统计、扫描线容量判定与日程（纯函数，含测试）
   validate.js   输入校验（非法质量/重复编号/越界）、400/409 错误类型
 public/         浏览器界面（原生 HTML/CSS/JS，无需构建）
-test/           node --test 测试（求解器 + HTTP API + 核验，共 42 项）
+test/           node --test 测试（求解器 + HTTP API + 核验 + 时段预约，共 60 项）
 Dockerfile / docker-compose.yml
 ```

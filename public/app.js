@@ -81,6 +81,7 @@ function renderAll() {
   renderDraft();
   renderPublications();
   renderVerifications();
+  renderReservations();
 }
 
 function renderHoleMax(d) {
@@ -704,6 +705,170 @@ $('#ver-close').addEventListener('click', () => {
   verRows = [];
   refresh().catch(() => {});
 });
+
+// ---------- 配重块时段预约 ----------
+
+const PHASE_LABEL = {
+  notStarted: '未开始',
+  ongoing: '进行中',
+  ended: '已结束',
+  cancelled: '已取消',
+};
+
+function usageText(usage) {
+  if (!usage || usage.length === 0) return '（不使用配重块）';
+  return usage.map((u) => `${u.mass} g × ${u.count}`).join('，');
+}
+
+function renderReservations() {
+  // 预约表单：可选发布图（仅当前可用）
+  const sel = $('#res-pub');
+  const usable = state.publications.filter((p) => p.usable);
+  const prev = sel.value;
+  sel.innerHTML = usable.length
+    ? usable
+        .map(
+          (p) =>
+            `<option value="${p.id}">#${p.id} · ${p.createdAt} · 配重 ${p.weightCount} 枚</option>`,
+        )
+        .join('')
+    : '<option value="">（暂无可用发布图）</option>';
+  if (usable.some((p) => String(p.id) === prev)) sel.value = prev;
+
+  // 预约列表
+  const box = $('#res-list');
+  const list = state.reservations || [];
+  if (list.length === 0) {
+    box.innerHTML = '<div class="muted">暂无预约记录。</div>';
+  } else {
+    box.innerHTML = `<div class="table-wrap"><table class="res-table">
+      <thead><tr>
+        <th>批次号</th><th>依据图</th><th>时段（UTC，左闭右开）</th><th>占用规格</th>
+        <th>状态</th><th>依据图当前可用</th><th></th>
+      </tr></thead><tbody>${list
+        .map(
+          (r) => `<tr>
+        <td><b>${escapeHtml(r.batchNo)}</b></td>
+        <td>#${r.publicationId}</td>
+        <td class="mono">${r.startUtc}<br>至 ${r.endUtc}</td>
+        <td>${escapeHtml(usageText(r.usage))}</td>
+        <td><span class="badge ${
+          r.status === 'cancelled' ? 'bad' : r.phase === 'ended' ? 'stale' : 'ok'
+        }">${PHASE_LABEL[r.phase]}</span></td>
+        <td>${
+          r.publicationUsable
+            ? '<span class="tag-ok">✓ 可用</span>'
+            : '<span class="tag-bad">✗ 已失效</span>'
+        }</td>
+        <td>${
+          r.cancellable
+            ? `<button data-res-cancel="${r.id}" class="danger">取消预约</button>`
+            : ''
+        }</td>
+      </tr>`,
+        )
+        .join('')}</tbody></table></div>`;
+    box.querySelectorAll('[data-res-cancel]').forEach((b) =>
+      b.addEventListener('click', () => cancelReservation(Number(b.dataset.resCancel))),
+    );
+  }
+
+  loadSchedule().catch(() => {});
+}
+
+async function loadSchedule() {
+  const sch = await api('GET', '/api/schedule');
+  const box = $('#res-schedule');
+  if (!sch.specs || sch.specs.length === 0) {
+    box.innerHTML = '<div class="muted">当前无生效中的预约占用。</div>';
+    return;
+  }
+  box.innerHTML = sch.specs
+    .map(
+      (s) => `<div class="spec-block">
+      <div class="spec-head">
+        <b>规格 ${s.mass} g</b>
+        <span class="muted">当前可选 ${s.capacity} 枚 · 时段内峰值占用 ${s.peak} 枚</span>
+        <span class="badge ${s.shortage ? 'bad' : 'ok'}">${
+          s.shortage ? '✗ 存在不足区段' : '✓ 数量充足'
+        }</span>
+      </div>
+      ${
+        s.segments.length
+          ? `<table class="pair-list">
+        <thead><tr><th>时段（UTC）</th><th>占用量</th><th>判定</th></tr></thead>
+        <tbody>${s.segments
+          .map(
+            (g) => `<tr${g.shortage ? ' class="row-bad"' : ''}>
+            <td class="mono">${g.start} 至 ${g.end}</td>
+            <td>${g.used} / ${s.capacity} 枚</td>
+            <td class="${g.shortage ? 'tag-bad' : 'tag-ok'}">${
+              g.shortage ? '✗ 不足' : '✓'
+            }</td>
+          </tr>`,
+          )
+          .join('')}</tbody></table>`
+          : '<div class="muted">该时段内无占用。</div>'
+      }
+    </div>`,
+    )
+    .join('');
+}
+
+// datetime-local 值按 UTC 解释（服务端对无时区后缀的 ISO 时间一律按 UTC 处理）
+function dtLocalToUtc(v) {
+  return v || '';
+}
+
+$('#res-submit').addEventListener('click', async () => {
+  const batchNo = $('#res-batch').value.trim();
+  const publicationId = Number($('#res-pub').value);
+  const startUtc = dtLocalToUtc($('#res-start').value);
+  const endUtc = dtLocalToUtc($('#res-end').value);
+  $('#res-conflict').innerHTML = '';
+  try {
+    const r = await api('POST', '/api/reservations', {
+      batchNo,
+      publicationId,
+      startUtc,
+      endUtc,
+    });
+    await refresh(
+      r.status === 'cancelled'
+        ? `批次号「${r.batchNo}」的预约此前已取消，返回原记录（未重新占用）。`
+        : `批次号「${r.batchNo}」预约已登记（占用 ${usageText(r.usage)}）。`,
+    );
+  } catch (e) {
+    // 容量不足：展示冲突规格与时段
+    const conflicts = e.data && e.data.detail && e.data.detail.conflicts;
+    if (e.status === 409 && conflicts) {
+      $('#res-conflict').innerHTML = `<div class="banner bad">
+        <b>可选数量不足，本次预约未产生任何占用：</b>
+        <ul>${conflicts
+          .map(
+            (c) =>
+              `<li>规格 ${c.mass} g：本次需 ${c.required} 枚，当前可选 ${c.capacity} 枚；` +
+              `冲突时段：${c.windows
+                .map((w) => `${w.start} 至 ${w.end}（已占用 ${w.used} 枚）`)
+                .join('；')}</li>`,
+          )
+          .join('')}</ul>
+      </div>`;
+      showAlert(e.message, 'err');
+    } else {
+      showAlert(e.message, 'err');
+    }
+  }
+});
+
+async function cancelReservation(id) {
+  try {
+    await api('POST', `/api/reservations/${id}/cancel`);
+    await refresh(`预约 #${id} 已取消（历史保留，占用已释放）。`);
+  } catch (e) {
+    showAlert(e.message, 'err');
+  }
+}
 
 // ---------- 启动 ----------
 

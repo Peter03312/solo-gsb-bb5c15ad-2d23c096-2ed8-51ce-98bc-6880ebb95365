@@ -64,6 +64,22 @@ CREATE TABLE IF NOT EXISTS publications (
   reasons TEXT
 );
 
+-- 配重块时段预约：batch_no 为幂等键（同批次号重复提交返回原记录、内容不同拒绝），
+-- 取消仅置 status/cancelled_at，历史保留且批次号仍被占用（同号重试不重新占用）。
+-- usage_json 为按冻结装载图统计的各质量规格占用量 [{mass, count}]，冻结不变。
+CREATE TABLE IF NOT EXISTS reservations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_no TEXT NOT NULL UNIQUE,
+  publication_id INTEGER NOT NULL,
+  start_utc TEXT NOT NULL,
+  end_utc TEXT NOT NULL,
+  usage_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'cancelled')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  cancelled_at TEXT,
+  FOREIGN KEY (publication_id) REFERENCES publications(id)
+);
+
 -- 现场装载核验：一条发布记录至多一份（草稿或完成），UNIQUE 约束兜底。
 -- version 为乐观锁：每次暂存自增，更新须携带旧版本以防覆盖他人修改。
 -- 完成后 completed_at 置位、result_json 冻结，之后草稿与完成结果均不可改写。
@@ -258,6 +274,76 @@ export function completeVerification(db, id, { checks, diffSum, massSum }) {
     )
     .run(JSON.stringify(checks), diffSum, massSum, id);
   return info.changes === 1 ? getVerificationRow(db, id) : null;
+}
+
+// 核验列表（连发布表取冻结依据与发布编号）
+export function listReservationRows(db) {
+  return db
+    .prepare(
+      `SELECT r.*, p.basis_hash AS pub_basis_hash, p.feasible AS pub_feasible
+         FROM reservations r
+         JOIN publications p ON p.id = r.publication_id
+        ORDER BY r.start_utc, r.id`,
+    )
+    .all();
+}
+
+export function getReservationRow(db, id) {
+  return db
+    .prepare(
+      `SELECT r.*, p.basis_hash AS pub_basis_hash, p.feasible AS pub_feasible
+         FROM reservations r
+         JOIN publications p ON p.id = r.publication_id
+        WHERE r.id = ?`,
+    )
+    .get(id);
+}
+
+export function getReservationRowByBatch(db, batchNo) {
+  return db
+    .prepare(
+      `SELECT r.*, p.basis_hash AS pub_basis_hash, p.feasible AS pub_feasible
+         FROM reservations r
+         JOIN publications p ON p.id = r.publication_id
+        WHERE r.batch_no = ?`,
+    )
+    .get(batchNo);
+}
+
+// 与 [startIso, endIso) 重叠的生效中预约（左闭右开：r.start < end 且 start < r.end）
+export function listOverlappingActiveReservations(db, startIso, endIso) {
+  return db
+    .prepare(
+      `SELECT * FROM reservations
+        WHERE status = 'active' AND start_utc < ? AND ? < end_utc`,
+    )
+    .all(endIso, startIso);
+}
+
+export function listActiveReservations(db) {
+  return db.prepare(`SELECT * FROM reservations WHERE status = 'active'`).all();
+}
+
+export function insertReservation(db, { batchNo, publicationId, startUtc, endUtc, usage }) {
+  const info = db
+    .prepare(
+      `INSERT INTO reservations (batch_no, publication_id, start_utc, end_utc, usage_json)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(batchNo, publicationId, startUtc, endUtc, JSON.stringify(usage));
+  return getReservationRow(db, info.lastInsertRowid);
+}
+
+// 取消：仅生效中且未开始的预约可取消（条件更新，未命中返回 null）。
+export function cancelReservation(db, id, nowIso) {
+  const info = db
+    .prepare(
+      `UPDATE reservations
+          SET status = 'cancelled', cancelled_at = ?
+        WHERE id = ? AND status = 'active' AND start_utc > ?`,
+    )
+    .run(nowIso, id, nowIso);
+  return info.changes === 1 ? getReservationRow(db, id) : null;
 }
 
 // 核验列表（连发布表取冻结依据与发布编号）

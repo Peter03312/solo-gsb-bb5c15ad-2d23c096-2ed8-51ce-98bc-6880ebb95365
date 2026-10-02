@@ -92,6 +92,37 @@
       </div>
       <div id="verify-list"></div>
     </section>
+
+    <section class="card" id="sec-reserve">
+      <h2>7. 配重块时段预约</h2>
+      <div class="muted" style="margin-bottom:10px">
+        以批次号预约「✓ 可用于当前装载」发布图所需的配重块；时段按 UTC
+        <b>左闭右开 [开始, 结束)</b> 计算，任一时刻同规格预约总量不得超过当前录入的可选数量。
+        同批次号同内容重复提交返回原记录，内容不同将被拒绝；仅未开始的预约可取消，取消后保留历史。
+      </div>
+      <div class="form-row">
+        <label>批次号
+          <input id="res-batch" type="text" placeholder="如 BATCH-2026-001" />
+        </label>
+        <label>依据发布图（仅当前可用）
+          <select id="res-pub"></select>
+        </label>
+        <label>开始时间（UTC）
+          <input id="res-start" type="datetime-local" step="60" />
+        </label>
+        <label>结束时间（UTC）
+          <input id="res-end" type="datetime-local" step="60" />
+        </label>
+      </div>
+      <div class="actions">
+        <button id="res-submit" class="primary">提交预约</button>
+      </div>
+      <div id="res-conflict"></div>
+      <h3>预约列表</h3>
+      <div id="res-list"></div>
+      <h3>占用日程（按当前可选数量判定，超限区段标记「不足」）</h3>
+      <div id="res-schedule"></div>
+    </section>
   </main>
 
   <dialog id="pub-dialog">
